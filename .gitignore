@@ -1,0 +1,6 @@
+**/target/
+apps/eksplora-app/node_modules/
+apps/eksplora-app/dist/
+*.db
+*.db-wal
+*.db-shm

@@ -1,0 +1,23 @@
+[package]
+name = "eksplora-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+jwalk = "0.8"
+rayon = "1.10"
+crossbeam-channel = "0.5"
+notify = "6"
+rusqlite = { version = "0.31", features = ["bundled"] }
+nucleo-matcher = "0.3"
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_IO",
+  "Win32_System_SystemServices",
+  "Win32_UI_Shell",
+] }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"

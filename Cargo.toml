@@ -1,0 +1,4 @@
+[workspace]
+members = ["crates/eksplora-core", "crates/eksplora-cli"]
+exclude = ["apps/eksplora-app/src-tauri"]
+resolver = "2"
