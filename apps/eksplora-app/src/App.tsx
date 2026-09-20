@@ -17,6 +17,10 @@ type ScanProgress = {
   path: string;
   files: number;
   dirs: number;
+  // Live per-folder counts from the walk stream: cumulative
+  // (dir path, direct children walked so far), only for dirs that
+  // changed since the previous tick.
+  counts: [string, number][];
 };
 
 type ScanPartial = {
@@ -93,9 +97,12 @@ function highlightName(name: string, query: string): React.ReactNode {
     </>
   );
 }
+// Drag-and-drop payload: the moved item's full path. `text/plain` carries
+// the same value as a fallback (some webviews drop custom mime types).
+const DRAG_MIME = "text/eksplora-path";
+
 // Depth of `full` relative to `base` (direct child = 1).
-function relDepth(full: string, base: string): number {
-  const b = base.replace(/[\\/]+$/, "");
+function relDepth(full: string, base: string): number {  const b = base.replace(/[\\/]+$/, "");
   const rest = full.startsWith(b) ? full.slice(b.length) : full;
   const parts = rest.split(/[\\/]+/).filter(Boolean);
   return Math.max(1, parts.length);
@@ -133,6 +140,11 @@ export default function App() {
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState("");
   const [progress, setProgress] = useState<ScanProgress | null>(null);
+  // Live per-folder counts streamed with scan-progress (~7Hz). Keyed by
+  // lowercase full path; values are cumulative and converge on the final
+  // index counts. Cleared on every new scan and on scan-done, when the
+  // index itself becomes authoritative again.
+  const [liveCounts, setLiveCounts] = useState<Record<string, number>>({});
   const [activePath, setActivePath] = useState("");
   const [copied, setCopied] = useState(false);
   const copyTimer = useRef<number | null>(null);
@@ -162,17 +174,135 @@ export default function App() {
   // Live completion fetch debounce + staleness guard.
   const compTimer = useRef<number | null>(null);
   const compSeq = useRef(0);
+  // Inline tree-expand: dir paths unfolded below their row. The path field
+  // and history are untouched — expanding never navigates.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  // Fetched direct children per expanded dir (refreshed as the index grows).
+  const [kids, setKids] = useState<Record<string, SearchHit[]>>({});
+  // Mirror for use inside async callbacks (state would be stale there).
+  const expandedRef = useRef<Set<string>>(new Set());
+  // Focused file row (single click). Dirs expand instead of selecting.
+  const [selected, setSelected] = useState<string | null>(null);
+  // Drop target highlight while dragging over a dir row or quick item.
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
+  // Finish flourish on the path preview after a scan completes.
+  const [justDone, setJustDone] = useState(false);
+  // Guards toggleDir against the second half of a double-click (which
+  // would otherwise expand-then-collapse instantly).
+  const lastToggleRef = useRef<{ path: string; t: number } | null>(null);
+  // Right-click context menu target + position. Panel = open flyout
+  // ('rename'/'duplicate' input or 'delete' confirm) next to its item.
+  const [ctx, setCtx] = useState<{ hit: SearchHit; x: number; y: number } | null>(null);
+  const [ctxPanel, setCtxPanel] = useState<"rename" | "duplicate" | null>(null);
+  const [menuError, setMenuError] = useState("");
+  const [renameVal, setRenameVal] = useState("");
+  const [dupVal, setDupVal] = useState("");
+  const renameInputRef = useRef<HTMLInputElement>(null);
+
+  // Quick access: user-pinned directories shown in the left sidebar.
+  // Persisted in localStorage; clicking a pin opens it in the file list.
+  const [quickDirs, setQuickDirs] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem("eksplora.quickDirs");
+      if (!raw) return [];
+      const arr: unknown = JSON.parse(raw);
+      if (!Array.isArray(arr)) return [];
+      return arr.filter((p): p is string => typeof p === "string" && !!p.trim()).slice(0, 100);
+    } catch {
+      return [];
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("eksplora.quickDirs", JSON.stringify(quickDirs));
+    } catch {
+      // storage full / unavailable — pins just won't survive reload
+    }
+  }, [quickDirs]);
+
+  // Short label for the sidebar: last segment only (`C:\Users\Bob` -> `Bob`,
+  // `C:\` stays `C:\`).
+  function quickName(p: string): string {
+    const t = p.replace(/[\\/]+$/, "");
+    if (/^[A-Za-z]:$/.test(t)) return `${t[0].toUpperCase()}:\\`;
+    const i = Math.max(t.lastIndexOf("\\"), t.lastIndexOf("/"));
+    const base = i >= 0 ? t.slice(i + 1) : t;
+    return base || p;
+  }
+
+  function isQuickPinned(p: string): boolean {
+    if (!p.trim()) return false;
+    const n = normPath(p).toLowerCase();
+    return quickDirs.some((q) => normPath(q).toLowerCase() === n);
+  }
+
+  function addQuickDir() {
+    pinDir(activePath);
+  }
+
+  function pinDir(p: string) {
+    if (!p || isQuickPinned(p)) return;
+    setQuickDirs((q) => [...q, p]);
+  }
+
+  function openQuickDir(p: string) {
+    setRoot(withTrailingSep(p));
+    doScan(p, null);
+  }
+
+  function removeQuickDir(p: string) {
+    const n = normPath(p).toLowerCase();
+    setQuickDirs((q) => q.filter((x) => normPath(x).toLowerCase() !== n));
+  }
+
+  // How many pinned dirs share each display name. Names appearing more
+  // than once get their full path shown underneath for disambiguation.
+  const quickNameCounts = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const p of quickDirs) {
+      const n = quickName(p).toLowerCase();
+      m.set(n, (m.get(n) ?? 0) + 1);
+    }
+    return m;
+  }, [quickDirs]);
+
+  // Default duplicate name: `notes-copy.txt`, `sub-copy`.
+  function duplicateDefault(name: string, isDir: boolean): string {
+    if (isDir) return `${name}-copy`;
+    const i = name.lastIndexOf(".");
+    if (i > 0) return `${name.slice(0, i)}-copy${name.slice(i)}`;
+    return `${name}-copy`;
+  }
+
+  // Flat render list: base hits with fetched children spliced below each
+  // expanded dir, recursively (nested expands nest deeper).
+  const displayHits = useMemo(() => {
+    if (expanded.size === 0) return hits;
+    const out: SearchHit[] = [];
+    const visit = (h: SearchHit) => {
+      out.push(h);
+      if (h.is_dir && expanded.has(h.path)) {
+        for (const c of kids[h.path] ?? []) visit(c);
+      }
+    };
+    hits.forEach(visit);
+    return out;
+  }, [hits, expanded, kids]);
 
   const rowVirtualizer = useVirtualizer({
-    count: hits.length,
+    count: displayHits.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => 30,
     overscan: 12,
   });
 
-  const totalSize = useMemo(() => rowVirtualizer.getTotalSize(), [rowVirtualizer, hits]);
+  const totalSize = useMemo(() => rowVirtualizer.getTotalSize(), [rowVirtualizer, displayHits]);
   const browsing = !query.trim();
   const ghost = ghostParts();
+  // Flyout panels (rename/duplicate) open leftwards when the menu sits
+  // close to the right viewport edge.
+  const flyLeft = ctx != null && ctx.x > window.innerWidth - 480;
 
   // `nav` records what triggered the request: typed text (null) or a history
   // button. The scan-done handler uses it to decide stack updates, so a
@@ -183,9 +313,16 @@ export default function App() {
     // results arrive via the scan-done event.
     navRef.current = nav;
     targetRef.current = p;
+    // New root, new tree: expanded rows belong to the old index.
+    expandedRef.current = new Set();
+    setExpanded(new Set());
+    setKids({});
+    setSelected(null);
+    setJustDone(false);
     setScanning(true);
     setScanError("");
     setProgress(null);
+    setLiveCounts({});
     try {
       await invoke<boolean>("scan_dir", { path: p });
     } catch (e) {
@@ -205,6 +342,7 @@ export default function App() {
       invoke("scan_cancel", {}).catch(() => {});
       setScanning(false);
       setProgress(null);
+      setLiveCounts({});
       return;
     }
     if (p === scannedRef.current || p === targetRef.current) return;
@@ -400,6 +538,289 @@ export default function App() {
     doScan(par, "up");
   }
 
+  // Drag and drop: move the dragged item into `targetDir`, keeping its
+  // name. Expands the target when it is a visible dir row so the moved
+  // item shows up right away.
+  async function moveIntoDir(srcPath: string, targetDir: string) {
+    if (!srcPath || !targetDir) return;
+    try {
+      // NOTE: Rust `target_dir` arrives as camelCase `targetDir`.
+      const newPath = await invoke<string>("move_entry", { path: srcPath, targetDir });
+      if (targetDir !== activeRef.current && !expandedRef.current.has(targetDir)) {
+        const next = new Set(expandedRef.current);
+        next.add(targetDir);
+        expandedRef.current = next;
+        setExpanded(new Set(next));
+      }
+      setSelected(newPath);
+      refresh();
+    } catch (e) {
+      setScanError(String(e));
+    }
+  }
+
+  // Read the dragged path back (custom mime first, plain-text fallback).
+  function dragSrc(e: React.DragEvent): string {
+    return e.dataTransfer.getData(DRAG_MIME) || e.dataTransfer.getData("text/plain");
+  }
+
+  // Row clicks: single click toggles folders inline and focuses files;
+  // double-click opens folders as the new root and launches files. The
+  // path field, history and scan are untouched by expanding.
+  function clickRow(h: SearchHit) {
+    setSelected(h.path);
+    if (h.is_dir) {
+      toggleDir(h.path);
+    }
+  }
+
+  // Double-click a directory opens it as the new root (history preserved),
+  // same as Open in the context menu.
+  function openDir(path: string) {
+    setRoot(withTrailingSep(path));
+    doScan(path, null);
+  }
+
+  async function openFile(path: string) {
+    setSelected(path);
+    try {
+      await invoke("open_path", { path });
+    } catch (e) {
+      setScanError(String(e));
+    }
+  }
+
+  // Bumped after copy/rename/delete: the backend already patched the live
+  // index, so this just re-runs the search + expanded layers. No rescan,
+  // no progress UI, tree/selection otherwise preserved.
+  const [refreshSeq, setRefreshSeq] = useState(0);
+  function refresh() {
+    expandedRef.current.forEach((p) => {
+      fetchKids(p);
+    });
+    setRefreshSeq((n) => n + 1);
+  }
+
+  function openCtx(e: React.MouseEvent, h: SearchHit) {
+    e.preventDefault();
+    setSelected(h.path);
+    setCtxPanel(null);
+    setMenuError("");
+    // Prefill the rename field with the full current name (extension
+    // included); the stem gets auto-selected on panel open below.
+    setRenameVal(h.name);
+    setDupVal(duplicateDefault(h.name, h.is_dir));
+    // Clamp so the ~230px menu never leaves the viewport.
+    setCtx({
+      hit: h,
+      x: Math.max(4, Math.min(e.clientX, window.innerWidth - 244)),
+      y: Math.max(4, Math.min(e.clientY, window.innerHeight - 210)),
+    });
+  }
+
+  function closeCtx() {
+    setCtx(null);
+    setCtxPanel(null);
+    setMenuError("");
+  }
+
+  // "Open" from the menu follows the path-field semantics: a directory
+  // becomes the new root (history preserved), a file launches.
+  function ctxOpen() {
+    const h = ctx?.hit;
+    if (!h) return;
+    if (h.is_dir) {
+      setRoot(withTrailingSep(h.path));
+      closeCtx();
+      doScan(h.path, null);
+      return;
+    }
+    closeCtx();
+    openFile(h.path);
+  }
+
+  // Copy stages the item for paste (in-app + OS clipboard) — nothing is
+  // created, so no refresh is needed.
+  async function ctxCopy() {
+    const h = ctx?.hit;
+    if (!h) return;
+    closeCtx();
+    try {
+      await invoke<string>("copy_entry", { path: h.path });
+    } catch (e) {
+      setScanError(String(e));
+    }
+  }
+
+  // Paste clipboard into the selected folder, or the current path when no
+  // folder is selected. Expands the target when it is a visible dir row.
+  async function pasteHere() {
+    const sel = displayHits.find((h) => h.path === selected);
+    const target = sel && sel.is_dir ? sel.path : activeRef.current;
+    if (!target) return;
+    try {
+      // NOTE: Rust `target_dir` arrives as camelCase `targetDir`.
+      const created = await invoke<string[]>("paste_entry", { targetDir: target });
+      if (created.length === 0) return;
+      if (target !== activeRef.current && !expandedRef.current.has(target)) {
+        const next = new Set(expandedRef.current);
+        next.add(target);
+        expandedRef.current = next;
+        setExpanded(new Set(next));
+      }
+      setSelected(created[0]);
+      refresh();
+    } catch (e) {
+      setScanError(String(e));
+    }
+  }
+
+  // Ctrl+Z restores the most recently deleted item from the Recycle Bin
+  // to its original place. Skipped while typing (inputs keep native undo).
+  async function undoDelete() {
+    try {
+      const restored = await invoke<string>("undo_entry", {});
+      setSelected(restored);
+      refresh();
+    } catch (e) {
+      setScanError(String(e));
+    }
+  }
+
+  // Ctrl+V pastes, Ctrl+Z undoes a delete — both skipped while typing
+  // (inputs keep their native paste/undo).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const t = document.activeElement;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+      if (e.key === "v" || e.key === "V") {
+        e.preventDefault();
+        pasteHere();
+      } else if (e.key === "z" || e.key === "Z") {
+        e.preventDefault();
+        undoDelete();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected, displayHits]);
+
+  async function ctxDuplicateCommit() {
+    const h = ctx?.hit;
+    const name = dupVal.trim();
+    if (!h || !name) return;
+    try {
+      // Rust `new_name` arrives as camelCase (see rename below).
+      const newPath = await invoke<string>("duplicate_entry", { path: h.path, newName: name });
+      setSelected(newPath);
+      closeCtx();
+      refresh();
+    } catch (e) {
+      setMenuError(String(e));
+    }
+  }
+
+  async function ctxRenameCommit() {
+    const h = ctx?.hit;
+    const name = renameVal.trim();
+    if (!h || !name) return;
+    try {
+      // NOTE: Tauri exposes Rust `new_name` to JS as camelCase `newName`.
+      const newPath = await invoke<string>("rename_entry", { path: h.path, newName: name });
+      setSelected(newPath);
+      closeCtx();
+      refresh();
+    } catch (e) {
+      setMenuError(String(e));
+    }
+  }
+
+  async function ctxDelete() {
+    const h = ctx?.hit;
+    if (!h) return;
+    try {
+      await invoke("delete_entry", { path: h.path });
+      // Drop any expanded/cached state for the deleted subtree.
+      if (expandedRef.current.has(h.path)) {
+        const next = new Set(expandedRef.current);
+        next.delete(h.path);
+        expandedRef.current = next;
+        setExpanded(new Set(next));
+      }
+      setKids((prev) => {
+        if (!(h.path in prev)) return prev;
+        const next = { ...prev };
+        delete next[h.path];
+        return next;
+      });
+      setSelected(null);
+      closeCtx();
+      refresh();
+    } catch (e) {
+      setMenuError(String(e));
+    }
+  }
+
+  // Escape closes the context menu.
+  useEffect(() => {
+    if (!ctx) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeCtx();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [ctx]);
+
+  // Explorer-style rename: when the panel opens, select the stem so typing
+  // replaces the name but keeps the extension (dirs select all).
+  useEffect(() => {
+    if (ctxPanel !== "rename" || !ctx) return;
+    const el = renameInputRef.current;
+    if (!el) return;
+    const name = ctx.hit.name;
+    const i = ctx.hit.is_dir ? -1 : name.lastIndexOf(".");
+    el.setSelectionRange(0, i > 0 ? i : name.length);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ctxPanel]);
+
+  // Fetch one layer of direct children for an expanded dir. Stale responses
+  // (new scan started, or collapsed meanwhile) are dropped.
+  async function fetchKids(path: string) {
+    const target = targetRef.current;
+    try {
+      const r = await invoke<SearchHit[]>("list_children", { path, limit: 2000 });
+      if (targetRef.current !== target) return;
+      if (!expandedRef.current.has(path)) return;
+      setKids((prev) => ({ ...prev, [path]: r }));
+    } catch {
+      // Unreadable / vanished dir — row stays expanded but childless.
+    }
+  }
+
+  function toggleDir(path: string) {
+    // Second half of a double-click on the same dir: ignore, so a
+    // double-click keeps the result of the first click instead of
+    // toggling twice (expand → collapse flash).
+    const now = performance.now();
+    const last = lastToggleRef.current;
+    if (last && last.path === path && now - last.t < 350) return;
+    lastToggleRef.current = { path, t: now };
+    if (expandedRef.current.has(path)) {
+      const next = new Set(expandedRef.current);
+      next.delete(path);
+      expandedRef.current = next;
+      setExpanded(new Set(next));
+      return;
+    }
+    const next = new Set(expandedRef.current);
+    next.add(path);
+    expandedRef.current = next;
+    setExpanded(new Set(next));
+    if (!kids[path]) fetchKids(path);
+  }
+
   // Live search: debounced backend query, virtualized render.
   // Empty query = browse mode (tree up to `depth` levels deep).
   // Stale responses are discarded via seq guard; backend also cancels
@@ -432,12 +853,24 @@ export default function App() {
     const h = setTimeout(run, 80);
     return () => clearTimeout(h);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query, limit, fuzzy, depth, scan]);
+  }, [query, limit, fuzzy, depth, scan, refreshSeq]);
+
+  // Keep expanded layers live: every index refresh (partial or done)
+  // re-fetches children of open dirs so the tree fills in as the
+  // progressive scan streams deeper layers.
+  useEffect(() => {
+    if (!scan || expandedRef.current.size === 0) return;
+    expandedRef.current.forEach((p) => {
+      fetchKids(p);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scan, refreshSeq]);
 
   useEffect(() => {
     let offProgress = () => {};
     let offPartial = () => {};
     let offDone = () => {};
+    let offFs = () => {};
     // First time a path becomes visible (first partial or final done),
     // publish it to the UI + history. Later partials for the same path
     // only refresh counts. Consumes navRef exactly once per path.
@@ -458,6 +891,16 @@ export default function App() {
         offProgress = await listen<ScanProgress>("scan-progress", (e) => {
           if (e.payload.path !== targetRef.current) return; // stale scan
           setProgress(e.payload);
+          // Fold live per-folder counts in (cumulative values, keyed by
+          // lowercase path). Rows overlay these while scanning.
+          const c = e.payload.counts;
+          if (c && c.length > 0) {
+            setLiveCounts((prev) => {
+              const next = { ...prev };
+              for (const [p, n] of c) next[p.toLowerCase()] = n;
+              return next;
+            });
+          }
         });
         // Progressive loading: shallow layer arrives first (~100ms),
         // deeper layers stream in. Each partial refreshes `scan`,
@@ -479,12 +922,22 @@ export default function App() {
           // this covers the (rare) case of done arriving with no partial.
           applyVisiblePath(d.path);
           setProgress(null);
+          setLiveCounts({}); // index is authoritative again
           setScanning(false);
+          // Finish flourish on the path preview (fills, then fades out).
+          setJustDone(true);
+        });
+        // External change by another process (file added/deleted outside
+        // the app): the backend already patched the live index, so just
+        // re-run the search + expanded layers. No rescan, tree preserved.
+        // `setRefreshSeq` is stable, so this is safe from a mount effect.
+        offFs = await listen("fs-changed", () => {
+          setRefreshSeq((n) => n + 1);
         });
         const s = await invoke<string>("sysinfo", {});
         setSysinfo(s);
         const p = await invoke<string>("desktop_path");
-        if (p) setRoot(p); // auto-scan effect picks it up after 0.5s
+        if (p) setRoot(withTrailingSep(p)); // auto-scan effect picks it up after 0.5s
         setQuery("");
       } catch (e) {
         setSysinfo(String(e));
@@ -494,6 +947,7 @@ export default function App() {
       offProgress();
       offPartial();
       offDone();
+      offFs();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -501,7 +955,9 @@ export default function App() {
   return (
     <div className="app">
       <div className="toolbar">
+      
         {scanning && <span className="scanning">Scanning</span>}
+
         <div className="path-wrap">
           {ghost && (
             <div className="ghost" aria-hidden="true">
@@ -516,7 +972,7 @@ export default function App() {
             value={root}
             onChange={(e) => onPathChange(e.target.value)}
             onKeyDown={onPathKeyDown}
-            onBlur={() => setCompOpen(false)}
+            onBlur={onPathBlur}
             placeholder="Type a folder path — suggestions as you type"
             spellCheck={false}
           />
@@ -579,7 +1035,7 @@ export default function App() {
         <span>index: {scan ? `${scan.len} entries (${scan.files}f/${scan.dirs}d, scan ${scan.duration_ms}ms)` : "not scanned"}</span>
         <span>
           {browsing
-            ? `browsing: ${hits.length} items · layers ≤ ${depth}`
+            ? `browsing: ${displayHits.length} items · layers ≤ ${depth}`
             : `query: ${hits.filter((h) => h.matched).length} matches · ${hits.length} rows in ${qms.toFixed(2)}ms`}
         </span>
         {scanError && <span className="error">{scanError}</span>}
@@ -617,10 +1073,30 @@ export default function App() {
         </button>
       </div>
       <div
-        className="current-path"
+        className={`current-path${justDone ? " complete" : ""}`}
         title={activePath ? `${activePath} — click to copy` : "Nothing indexed yet"}
         onClick={copyActivePath}
+        onAnimationEnd={() => setJustDone(false)}
       >
+        <button
+          className={`pin-btn${isQuickPinned(activePath) ? " added" : ""}`}
+          disabled={!activePath || isQuickPinned(activePath)}
+          title={isQuickPinned(activePath) ? "Already in Quick access" : "Add this folder to Quick access"}
+          onClick={(e) => {
+            e.stopPropagation();
+            addQuickDir();
+          }}
+        >
+          <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
+            <path
+              d="M7 1.2l1.7 3.6 3.9.5-2.9 2.7.7 3.9L7 10l-3.4 1.9.7-3.9L1.4 5.3l3.9-.5L7 1.2z"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </button>
         <FolderIcon />
         <span className="current-path-text">{activePath + "\\" || "—"}</span>
         {copied && <span className="copied">copied</span>}
@@ -631,29 +1107,113 @@ export default function App() {
         )}
         {scanning && !progress && <span className="prog-counts">starting…</span>}
       </div>
-      {scanning && (
-        <div className="progress-track">
-          <div className="progress-fill" />
-        </div>
-      )}
-      <div className="list" ref={parentRef}>
-        {hits.length === 0 && !scanning && scan ? (
+      <div className="main-row">
+        <aside className="quick">
+          <div className="quick-title">Quick access</div>
+          <div
+            className="quick-list"
+            onDragOver={(e) => {
+              e.preventDefault();
+              e.dataTransfer.dropEffect = "move";
+            }}
+          >
+            {quickDirs.length === 0 ? (
+              <div className="quick-empty">Pin folders with the star above.</div>
+            ) : (
+              quickDirs.map((p, i) => (
+                <div
+                  key={normPath(p).toLowerCase()}
+                  className={`quick-item${normPath(p).toLowerCase() === normPath(activePath).toLowerCase() ? " selected" : ""}${dropTarget === p ? " drop-target" : ""}`}
+                  title={p}
+                  style={{ animationDelay: `${Math.min(i * 25, 200)}ms` }}
+                  onClick={() => openQuickDir(p)}
+                  onDragEnter={(e) => {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = "move";
+                    setDropTarget(p);
+                  }}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = "move";
+                    setDropTarget(p);
+                  }}
+                  onDragLeave={(e) => {
+                    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+                    setDropTarget((t) => (t === p ? null : t));
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setDropTarget(null);
+                    const src = dragSrc(e);
+                    if (src) moveIntoDir(src, p);
+                  }}
+                >
+                  <FolderIcon />
+                  <span className="quick-text">
+                    <span className="quick-name">{quickName(p)}</span>
+                    {(quickNameCounts.get(quickName(p).toLowerCase()) ?? 0) > 1 && (
+                      <span className="quick-path">{p}</span>
+                    )}
+                  </span>
+                  <button
+                    className="quick-remove"
+                    title={`Remove ${quickName(p)} from Quick access`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      removeQuickDir(p);
+                    }}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+        </aside>
+        <div
+          className="list"
+          ref={parentRef}
+          onDragOver={(e) => {
+            // Allows drops on the list background (= the current folder).
+            // Dir rows handle their own drops and stop propagation.
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "move";
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            const src = dragSrc(e);
+            if (src && activeRef.current) moveIntoDir(src, activeRef.current);
+          }}
+        >
+        {displayHits.length === 0 && !scanning && scan ? (
           <div className="empty">{browsing ? "Directory is empty." : `No results for "${query}".`}</div>
         ) : (
           <div style={{ height: totalSize, position: "relative" }}>
             {rowVirtualizer.getVirtualItems().map((v) => {
-              const h = hits[v.index];
+              const h = displayHits[v.index];
               if (!h) return null;
               // Indent against the indexed path, not the text being typed —
               // otherwise rows jump right on the first keystroke.
               const d = relDepth(h.path, activePath || root);
               // Dirs show item count, files show size, in both modes.
-              const lastCol = h.is_dir ? h.child_count : formatSize(h.size);
+              // While scanning, overlay the live streamed count (cumulative
+              // direct children walked so far); Math.max keeps the display
+              // monotonic even if a progress tick arrives out of order.
+              const live = scanning && h.is_dir ? liveCounts[h.path.toLowerCase()] : undefined;
+              const lastCol = h.is_dir ? Math.max(h.child_count, live ?? 0) : formatSize(h.size);
               const tip = !browsing && h.matched ? `${h.score} · ${h.path}` : h.path;
+              // Tree guides: full spines for ancestor levels, then an elbow
+              // cell (├, or └ when nothing follows at this level) whose stub
+              // runs from the parent's spine to this row's icon.
+              const nextH = displayHits[v.index + 1];
+              const nextD = nextH ? relDepth(nextH.path, activePath || root) : 0;
+              const isLast = !nextH || nextD <= d;
+              const spines = Math.max(0, d - 2);
               return (
                 <div
                   key={v.key}
-                  className="row"
+                  className={`row${selected === h.path ? " selected" : ""}${dropTarget === h.path ? " drop-target" : ""}`}
                   style={{
                     position: "absolute",
                     top: 0,
@@ -662,15 +1222,70 @@ export default function App() {
                     boxSizing: "border-box",
                     height: v.size,
                     transform: `translateY(${v.start}px)`,
-                    paddingLeft: 10 + (d - 1) * 18,
+                    paddingLeft: 10,
                     paddingRight: 10,
+                    cursor: "pointer",
                   }}
-                  title={tip}
+                  title={`${tip} — ${h.is_dir ? "click to expand/collapse · double-click to open" : "click to select · double-click to open"}`}
+                  onClick={() => clickRow(h)}
+                  onDoubleClick={() => {
+                    if (h.is_dir) openDir(h.path);
+                    else openFile(h.path);
+                  }}
+                  onContextMenu={(e) => openCtx(e, h)}
+                  draggable
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData(DRAG_MIME, h.path);
+                    e.dataTransfer.setData("text/plain", h.path);
+                    e.dataTransfer.effectAllowed = "move";
+                    setSelected(h.path);
+                  }}
+                  onDragEnd={() => setDropTarget(null)}
+                  // Both dragenter and dragover cancel the event: some
+                  // engines only authorize the drop (move cursor instead of
+                  // the red cross) when dragenter is canceled too. Files
+                  // allow the cursor as well — their drop bubbles to the
+                  // list background (= the current folder); only dirs
+                  // highlight and take the drop themselves.
+                  onDragEnter={(e) => {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = "move";
+                    if (h.is_dir) setDropTarget(h.path);
+                  }}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = "move";
+                    if (h.is_dir) setDropTarget(h.path);
+                  }}
+                  onDragLeave={(e) => {
+                    // Ignore moves between the row's own children.
+                    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+                    if (h.is_dir) setDropTarget((t) => (t === h.path ? null : t));
+                  }}
+                  onDrop={
+                    h.is_dir
+                      ? (e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setDropTarget(null);
+                          const src = dragSrc(e);
+                          if (src) moveIntoDir(src, h.path);
+                        }
+                      : undefined
+                  }
                 >
+                  {Array.from({ length: spines }).map((_, i) => (
+                    <span key={i} className="guide" aria-hidden="true" />
+                  ))}
+                  {d >= 2 ? (
+                    <span className={isLast ? "ell" : "tee"} aria-hidden="true" />
+                  ) : null}
                   {h.is_dir ? <FolderIcon /> : <FileIcon />}
                   <span className="path">
                     {!browsing && h.matched ? highlightName(h.name, query) : h.name}
-                    <span className="score">{h.is_dir ? " :"+lastCol+"" : ""}</span>
+                    <span className={`score${scanning && h.is_dir ? " counting" : ""}`}>
+                      {h.is_dir ? " :" + lastCol + "" : ""}
+                    </span>
                   </span>
                   <span className="score">{h.is_dir ? "" : lastCol}</span>
                 </div>
@@ -678,8 +1293,118 @@ export default function App() {
             })}
           </div>
         )}
+        </div>
       </div>
       <div className="sysinfo">{sysinfo}</div>
+      {ctx && (
+        <>
+          <div
+            className="ctx-backdrop"
+            onClick={closeCtx}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              closeCtx();
+            }}
+          />
+          <div className="ctx-menu" style={{ left: ctx.x, top: ctx.y }}>
+            <div className="ctx-item" onClick={ctxOpen}>
+              <span className="ctx-label">Open</span>
+            </div>
+            <div className="ctx-item" onClick={ctxCopy}>
+              <span className="ctx-label">Copy</span>
+            </div>
+            {ctx.hit.is_dir && !isQuickPinned(ctx.hit.path) && (
+              <div
+                className="ctx-item"
+                onClick={() => {
+                  pinDir(ctx.hit.path);
+                  closeCtx();
+                }}
+              >
+                <span className="ctx-label">Pin to Quick access</span>
+              </div>
+            )}
+            <div className="ctx-item-wrap">
+              <div
+                className={`ctx-item${ctxPanel === "duplicate" ? " active" : ""}`}
+                onClick={() => {
+                  setCtxPanel("duplicate");
+                  if (ctx) setDupVal(duplicateDefault(ctx.hit.name, ctx.hit.is_dir));
+                  setMenuError("");
+                }}
+              >
+                <span className="ctx-label">Duplicate</span>
+              </div>
+              {ctxPanel === "duplicate" && (
+                <div className={`ctx-sub col${flyLeft ? " left" : ""}`}>
+                  <input
+                    className="ctx-input"
+                    autoFocus
+                    value={dupVal}
+                    placeholder={ctx.hit.name}
+                    spellCheck={false}
+                    onChange={(e) => setDupVal(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") ctxDuplicateCommit();
+                      else if (e.key === "Escape") {
+                        e.stopPropagation();
+                        setCtxPanel(null);
+                      }
+                    }}
+                  />
+                  {menuError && (
+                    <div className="ctx-field-error" key={menuError}>
+                      {menuError}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="ctx-item-wrap">
+              <div
+                className={`ctx-item${ctxPanel === "rename" ? " active" : ""}`}
+                onClick={() => {
+                  setCtxPanel("rename");
+                  // (Re)prefill the full current name — extension included.
+                  if (ctx) setRenameVal(ctx.hit.name);
+                  setMenuError("");
+                }}
+              >
+                <span className="ctx-label">Rename</span>
+              </div>
+              {ctxPanel === "rename" && (
+                <div className={`ctx-sub col${flyLeft ? " left" : ""}`}>
+                  <input
+                    className="ctx-input"
+                    autoFocus
+                    ref={renameInputRef}
+                    value={renameVal}
+                    placeholder={ctx.hit.name}
+                    spellCheck={false}
+                    onChange={(e) => setRenameVal(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") ctxRenameCommit();
+                      else if (e.key === "Escape") {
+                        e.stopPropagation();
+                        setCtxPanel(null);
+                      }
+                    }}
+                  />
+                  {menuError && (
+                    <div className="ctx-field-error" key={menuError}>
+                      {menuError}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="ctx-item danger" onClick={ctxDelete}>
+              <span className="ctx-label">Delete</span>
+            </div>
+            {!ctxPanel && menuError && <div className="ctx-error">{menuError}</div>}
+          </div>
+        </>
+      )}
     </div>
   );
 }

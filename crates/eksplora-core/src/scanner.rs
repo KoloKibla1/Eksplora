@@ -1,5 +1,6 @@
 use crate::types::FileEntry;
 use jwalk::{Parallelism, WalkDir};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -78,6 +79,36 @@ const CACHE_DIR_NAMES: &[&str] = &[
 fn is_cache_dir_name(name: &std::ffi::OsStr) -> bool {
     let lower = name.to_string_lossy().to_lowercase();
     CACHE_DIR_NAMES.iter().any(|c| *c == lower)
+}
+
+/// Whether `path` would be pruned by the default scan filters, mirroring
+/// the traversal-time rules exactly: any directory component strictly below
+/// `root` with a system/cache name prunes the whole subtree. The root
+/// itself is exempt (same as the scan), paths outside the root are treated
+/// as pruned, and a matching final component only prunes when it is a
+/// directory (the scan keeps files, testing dir names only).
+/// The file watcher uses this so externally created `node_modules`/bin
+/// content never pollutes an index the scan deliberately excludes.
+pub(crate) fn is_pruned_path(root: &Path, path: &Path) -> bool {
+    let rel = match path.strip_prefix(root) {
+        Ok(r) => r,
+        Err(_) => return true,
+    };
+    let comps: Vec<_> = rel.components().collect();
+    if comps.is_empty() {
+        return false; // the root itself
+    }
+    let last_is_dir = path.is_dir();
+    for (i, c) in comps.iter().enumerate() {
+        if i + 1 == comps.len() && !last_is_dir {
+            continue; // a file keeps its name, whatever it is
+        }
+        let name = c.as_os_str();
+        if is_system_dir_name(name) || is_cache_dir_name(name) {
+            return true;
+        }
+    }
+    false
 }
 
 fn scan_threads(explicit: Option<usize>) -> usize {
@@ -210,6 +241,53 @@ pub fn scan_shallow(root: &Path, opts: &ScanOptions) -> (Vec<FileEntry>, ScanSta
 /// merge into a live index should additionally throttle by time (see the
 /// Tauri `scan_dir` command) so UI refreshes stay at ~0.5Hz.
 pub const STREAM_BATCH: usize = 8192;
+
+/// Cumulative per-directory direct-children counter fed from streamed walk
+/// batches (`scan_with_full_streaming`'s `on_batch`). Totals only grow.
+/// `drain_changed` returns cumulative values for the dirs that changed since
+/// the previous drain, so the UI can show live per-folder counts during a
+/// scan without waiting for index merges.
+///
+/// Counting rule matches [`crate::indexer::Index::child_counts`]: every
+/// walked entry adds one direct child to its parent, so once the walk
+/// completes these totals equal the index's authoritative counts exactly.
+#[derive(Debug, Default)]
+pub struct LiveDirCounts {
+    /// parent dir -> (total walked so far, total already drained)
+    counts: HashMap<PathBuf, (u64, u64)>,
+}
+
+impl LiveDirCounts {
+    pub fn new() -> Self {
+        Self { counts: HashMap::new() }
+    }
+
+    /// Count one streamed batch. Batches must be non-overlapping (the
+    /// streaming contract guarantees this) — each entry is counted once.
+    pub fn add_batch(&mut self, batch: &[FileEntry]) {
+        for e in batch {
+            if let Some(parent) = e.path.parent() {
+                // Clones only on first sight of a dir; steady state is a
+                // plain map lookup on the walk's consumer thread.
+                self.counts.entry(parent.to_path_buf()).or_default().0 += 1;
+            }
+        }
+    }
+
+    /// Cumulative `(dir, total)` for every dir that changed since the last
+    /// drain. Skipped ticks lose nothing: values are cumulative, so the next
+    /// drain covers the gap.
+    pub fn drain_changed(&mut self) -> Vec<(PathBuf, u64)> {
+        let mut out = Vec::new();
+        for (p, (total, sent)) in self.counts.iter_mut() {
+            if *total != *sent {
+                *sent = *total;
+                out.push((p.clone(), *total));
+            }
+        }
+        out
+    }
+}
 
 /// Streaming variant of [`scan_with_full`]: `on_batch` receives slices of
 /// newly walked entries (drained every [`STREAM_BATCH`] entries and once at
@@ -530,6 +608,151 @@ mod tests {
         assert_eq!(seen.len(), entries.len(), "batches must cover every entry exactly once");
         let full: HashSet<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
         assert_eq!(*seen, full);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn live_counts_match_index_at_walk_end() {
+        use crate::indexer::Index;
+        let root = tmp_root("live-counts");
+        std::fs::create_dir_all(root.join("a").join("deep")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        for i in 0..300 {
+            std::fs::write(root.join(format!("top{:03}.txt", i)), "x").unwrap();
+        }
+        for i in 0..50 {
+            std::fs::write(root.join("a").join(format!("a{:02}.txt", i)), "x").unwrap();
+        }
+        for i in 0..20 {
+            std::fs::write(root.join("a").join("deep").join(format!("d{:02}.txt", i)), "x").unwrap();
+        }
+        std::fs::write(root.join("b").join("only.txt"), "x").unwrap();
+        // Small batches => many cumulative drains, mimicking live UI ticks.
+        // `seen` keeps the latest cumulative value per dir across drains.
+        let seen = std::cell::RefCell::new(HashMap::<PathBuf, u64>::new());
+        let live_cell = std::cell::RefCell::new(LiveDirCounts::new());
+        let (entries, stats) = scan_streaming_inner(
+            &root,
+            &ScanOptions::default(),
+            None,
+            None,
+            Some(&|batch: &[FileEntry]| {
+                let mut l = live_cell.borrow_mut();
+                l.add_batch(batch);
+                let mut s = seen.borrow_mut();
+                for (p, total) in l.drain_changed() {
+                    s.insert(p, total);
+                }
+            }),
+            64,
+        );
+        assert!(!stats.cancelled);
+        // Nothing left undrained after the final batch.
+        assert!(live_cell.borrow_mut().drain_changed().is_empty());
+        // Cumulative stream must equal the index's authoritative counts.
+        let idx = Index::from_entries(entries);
+        let authoritative = idx.child_counts();
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), authoritative.len(), "same dir set");
+        for (p, n) in authoritative.iter() {
+            assert_eq!(seen.get(p).copied().unwrap_or(0), *n as u64, "count for {}", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn live_counts_drain_reports_only_changed() {
+        let root = tmp_root("live-drain");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("x.txt"), "x").unwrap();
+        let (entries, _) = scan(&root, &ScanOptions::default());
+        // Split into two batches to simulate two walk ticks.
+        let mut live = LiveDirCounts::new();
+        live.add_batch(&entries[..1]);
+        let first = live.drain_changed();
+        assert_eq!(first.len(), 1);
+        assert!(live.drain_changed().is_empty(), "second drain without input is empty");
+        live.add_batch(&entries[1..]);
+        let second = live.drain_changed();
+        // Cumulative: re-reports the dirs that changed, nothing else.
+        assert!(second.len() >= 1);
+        assert!(live.drain_changed().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pruned_path_mirrors_scan_filters() {
+        let root = tmp_root("pruned");
+        std::fs::create_dir_all(&root).unwrap();
+        // Outside the tree is always ignored.
+        assert!(is_pruned_path(&root, &PathBuf::from("C:\\other\\x.txt")));
+        // The root itself is exempt, even with a suspicious name.
+        assert!(!is_pruned_path(&root, &root));
+        // Plain content passes.
+        assert!(!is_pruned_path(&root, &root.join("docs").join("a.txt")));
+        // Cache/system dirs prune their whole subtree (files and dirs).
+        std::fs::create_dir_all(root.join("node_modules").join("pkg")).unwrap();
+        std::fs::create_dir_all(root.join("$Recycle.Bin")).unwrap();
+        std::fs::create_dir_all(root.join("proj").join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("NODE_MODULES")).unwrap();
+        assert!(is_pruned_path(&root, &root.join("node_modules").join("pkg").join("x.js")));
+        assert!(is_pruned_path(&root, &root.join("node_modules")));
+        assert!(is_pruned_path(&root, &root.join("$Recycle.Bin").join("$Iabc.txt")));
+        assert!(is_pruned_path(&root, &root.join("proj").join(".git").join("HEAD")));
+        // Case-insensitive like the scan (NODE_MODULES prunes too).
+        assert!(is_pruned_path(&root, &root.join("NODE_MODULES").join("x.js")));
+        // But a *file* that merely looks like a cache dir is kept — the
+        // scan tests directory names only.
+        std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("node_modules"), "not a dir").unwrap();
+        assert!(!is_pruned_path(&root, &root.join("node_modules")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn watch_batch_applies_external_changes() {
+        use crate::indexer::Index;
+        let root = tmp_root("watch-apply");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("old.txt"), "o").unwrap();
+        let (entries, _) = scan(&root, &ScanOptions::default());
+        let mut idx = Index::from_entries(entries);
+        // Externally added file appears, externally deleted one vanishes.
+        std::fs::write(root.join("fresh.txt"), "n").unwrap();
+        std::fs::remove_file(root.join("sub").join("old.txt")).unwrap();
+        let (up, del) = idx.apply_watch_batch(
+            &root,
+            &[root.join("fresh.txt"), root.join("sub").join("old.txt")],
+        );
+        assert_eq!((up, del), (1, 1));
+        let rows = crate::query::list_dir(
+            &idx,
+            &root,
+            &crate::query::ListOptions { limit: 2000, dirs_first: true, max_depth: None },
+        );
+        let names: Vec<&str> = rows.iter().map(|r| r.entry.name.as_str()).collect();
+        assert!(names.contains(&"fresh.txt"));
+        assert!(!names.iter().any(|n| *n == "old.txt"));
+        // Pruned and outside paths are ignored, not indexed.
+        std::fs::create_dir_all(root.join("node_modules").join("pkg")).unwrap();
+        std::fs::write(root.join("node_modules").join("pkg").join("x.js"), "x").unwrap();
+        let (up2, del2) = idx.apply_watch_batch(
+            &root,
+            &[
+                root.join("node_modules").join("pkg").join("x.js"),
+                PathBuf::from("C:\\other\\x.txt"),
+            ],
+        );
+        assert_eq!((up2, del2), (0, 0));
+        let names2: Vec<&str> = crate::query::list_dir(
+            &idx,
+            &root,
+            &crate::query::ListOptions { limit: 2000, dirs_first: true, max_depth: None },
+        )
+        .iter()
+        .map(|r| r.entry.name.as_str())
+        .collect();
+        assert!(!names2.iter().any(|n| *n == "x.js"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

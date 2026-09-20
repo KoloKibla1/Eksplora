@@ -3,7 +3,7 @@ use crate::types::FileEntry;
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone)]
@@ -54,7 +54,9 @@ pub fn list_dir<'a>(index: &'a Index, dir: &Path, opts: &ListOptions) -> Vec<Lis
     let limit = opts.limit.clamp(1, 5000);
     let max = opts.max_depth.unwrap_or(usize::MAX).clamp(1, 64);
 
-    let counts = count_children(&index.entries, dir);
+    // Cached across searches until the next index mutation (was rebuilt
+    // from scratch on every call).
+    let counts = index.child_counts();
 
     let items: Vec<&FileEntry> = index
         .entries
@@ -82,19 +84,6 @@ pub fn list_dir<'a>(index: &'a Index, dir: &Path, opts: &ListOptions) -> Vec<Lis
         .collect();
     out.truncate(limit);
     out
-}
-
-/// Direct-children counts for every directory under `dir` (no depth cap).
-fn count_children<'a>(entries: &'a [FileEntry], dir: &Path) -> HashMap<&'a Path, usize> {
-    let mut counts: HashMap<&'a Path, usize> = HashMap::new();
-    for e in entries {
-        if e.path.strip_prefix(dir).is_ok() {
-            if let Some(parent) = e.path.parent() {
-                *counts.entry(parent).or_default() += 1;
-            }
-        }
-    }
-    counts
 }
 
 /// Order entries as a real tree (DFS pre-order): each directory is
@@ -223,7 +212,7 @@ pub fn search_tree_cancelable<'a>(
         return None;
     }
 
-    let counts = count_children(&index.entries, dir);
+    let counts = index.child_counts();
     let items: Vec<&'a FileEntry> = index
         .entries
         .par_iter()
@@ -270,23 +259,76 @@ fn search_inner<'a>(
     }
     let limit = opts.limit.clamp(1, 5000);
 
+    // Prefix-narrowing: the query extends a cached previous search. Matches
+    // only shrink when the query grows (any alignment witnessing the longer
+    // query also witnesses its prefix, for both substring and nucleo fuzzy),
+    // so re-scoring the cached candidates equals a full scan at a fraction
+    // of the cost. Typing "pho" after "ph" scans thousands of candidates
+    // instead of the whole index.
+    if let Some(cached) = index.lookup_query_cache(&q, opts.fuzzy) {
+        if cancelled() {
+            return None;
+        }
+        if cached.query == q {
+            // Exact repeat (e.g. a scan-partial re-ran the same query):
+            // scores are still valid, just re-resolve, sort, truncate.
+            let mut hits: Vec<MatchedEntry<'a>> = cached
+                .candidates
+                .iter()
+                .filter_map(|(score, path)| {
+                    index
+                        .resolve(path)
+                        .map(|entry| MatchedEntry { entry, score: *score })
+                })
+                .collect();
+            if cancelled() {
+                return None;
+            }
+            sort_hits(&mut hits);
+            hits.truncate(limit);
+            return Some(hits);
+        }
+        let mut matcher = Matcher::new(Config::DEFAULT);
+        let mut hits: Vec<MatchedEntry<'a>> = Vec::new();
+        let mut buf1 = Vec::new();
+        let q32 = Utf32Str::new(&q, &mut buf1);
+        for chunk in cached.candidates.chunks(4096) {
+            if cancelled() {
+                return None;
+            }
+            let mut buf2 = Vec::new();
+            for (_, path) in chunk {
+                let Some(e) = index.resolve(path) else {
+                    continue;
+                };
+                if let Some(score) = substring_score(&e.name_lower, &q) {
+                    hits.push(MatchedEntry { entry: e, score });
+                } else if opts.fuzzy {
+                    let h32 = Utf32Str::new(&e.name_lower, &mut buf2);
+                    if let Some(score) = matcher.fuzzy_match(h32, q32) {
+                        hits.push(MatchedEntry {
+                            entry: e,
+                            score: u32::from(score),
+                        });
+                    }
+                }
+            }
+        }
+        if cancelled() {
+            return None;
+        }
+        sort_hits(&mut hits);
+        index.store_query_cache(q.clone(), opts.fuzzy, snapshot_candidates(&hits));
+        hits.truncate(limit);
+        return Some(hits);
+    }
+
     // Stage 1: substring, parallel. Score exact-name-match higher.
     let mut hits: Vec<MatchedEntry<'a>> = index
         .entries
         .par_iter()
         .filter_map(|e| {
-            if e.name_lower.contains(&q) {
-                let score = if e.name_lower == q {
-                    10_000
-                } else if e.name_lower.starts_with(&q) {
-                    5_000
-                } else {
-                    1_000
-                };
-                Some(MatchedEntry { entry: e, score })
-            } else {
-                None
-            }
+            substring_score(&e.name_lower, &q).map(|score| MatchedEntry { entry: e, score })
         })
         .collect();
 
@@ -295,12 +337,9 @@ fn search_inner<'a>(
     }
 
     // Sort substring hits: dirs/files mixed, shortest name first (usually best).
-    hits.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then(a.entry.name.len().cmp(&b.entry.name.len()))
-    });
+    sort_hits(&mut hits);
     if hits.len() >= limit || !opts.fuzzy {
+        index.store_query_cache(q.clone(), opts.fuzzy, snapshot_candidates(&hits));
         hits.truncate(limit);
         return Some(hits);
     }
@@ -337,7 +376,40 @@ fn search_inner<'a>(
             score: u32::from(score),
         });
     }
+    index.store_query_cache(q.clone(), opts.fuzzy, snapshot_candidates(&hits));
     Some(hits)
+}
+
+/// Stage-1 scoring: exact name > prefix > substring. `None` when the name
+/// does not contain the query.
+fn substring_score(name_lower: &str, q: &str) -> Option<u32> {
+    if name_lower.contains(q) {
+        Some(if name_lower == q {
+            10_000
+        } else if name_lower.starts_with(q) {
+            5_000
+        } else {
+            1_000
+        })
+    } else {
+        None
+    }
+}
+
+fn sort_hits(hits: &mut [MatchedEntry<'_>]) {
+    hits.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then(a.entry.name.len().cmp(&b.entry.name.len()))
+    });
+}
+
+/// Snapshot scored refs into owned pairs for the query cache. Must be the
+/// untruncated set — narrowing needs every candidate, not just the top-`limit`.
+fn snapshot_candidates(hits: &[MatchedEntry<'_>]) -> Vec<(u32, PathBuf)> {
+    hits.iter()
+        .map(|h| (h.score, h.entry.path.clone()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -484,5 +556,175 @@ mod tests {
         let idx = sample_index();
         let flag = AtomicBool::new(true);
         assert!(search_tree_cancelable(&idx, Path::new("C:\\Root"), "deep", &QueryOptions::default(), &flag).is_none());
+    }
+
+    // ---- query/count cache tests ----
+
+    fn idx_with(files: &[(&str, bool)]) -> Index {
+        let mut idx = Index::new();
+        for (p, dir) in files {
+            idx.upsert(entry(p, *dir));
+        }
+        idx
+    }
+
+    fn sig(idx: &Index, q: &str, fuzzy: bool) -> Vec<(String, u32)> {
+        search(idx, q, &QueryOptions { limit: 100, fuzzy })
+            .iter()
+            .map(|h| (h.entry.path.to_string_lossy().into_owned(), h.score))
+            .collect()
+    }
+
+    const CACHE_NAMES: &[(&str, bool)] = &[
+        ("C:\\R", true),
+        ("C:\\R\\photo.jpg", false),
+        ("C:\\R\\Photoshop.exe", false),
+        ("C:\\R\\Photos", true),
+        ("C:\\R\\phone.txt", false),
+        ("C:\\R\\aphid.txt", false),
+        ("C:\\R\\graph.txt", false),
+        // Fuzzy-only for "pho": p,h,o in order but not consecutive.
+        ("C:\\R\\pxho.txt", false),
+        ("C:\\R\\unrelated.txt", false),
+    ];
+
+    #[test]
+    fn narrowed_typing_matches_full_search() {
+        // Simulate typing char by char on one index (populates the cache
+        // chain) and compare each step against a fresh full scan.
+        for fuzzy in [false, true] {
+            let shared = idx_with(CACHE_NAMES);
+            for q in ["ph", "pho", "phot", "photo"] {
+                let narrowed = sig(&shared, q, fuzzy);
+                let full = sig(&idx_with(CACHE_NAMES), q, fuzzy);
+                assert_eq!(narrowed, full, "q={q} fuzzy={fuzzy}");
+            }
+        }
+    }
+
+    #[test]
+    fn backspace_hits_exact_cache() {
+        for fuzzy in [false, true] {
+            let shared = idx_with(CACHE_NAMES);
+            let _ = sig(&shared, "phot", fuzzy);
+            let back = sig(&shared, "pho", fuzzy);
+            assert_eq!(back, sig(&idx_with(CACHE_NAMES), "pho", fuzzy));
+        }
+    }
+
+    #[test]
+    fn exact_repeat_is_stable() {
+        let shared = idx_with(CACHE_NAMES);
+        let first = sig(&shared, "pho", true);
+        assert_eq!(sig(&shared, "pho", true), first);
+    }
+
+    #[test]
+    fn mutation_invalidates_query_cache() {
+        let mut shared = idx_with(CACHE_NAMES);
+        let before = sig(&shared, "pho", true);
+        assert!(!before.iter().any(|(p, _)| p.contains("phoenix")));
+        shared.upsert(entry("C:\\R\\phoenix.txt", false));
+        let after = sig(&shared, "pho", true);
+        assert!(after.iter().any(|(p, _)| p.contains("phoenix")));
+        assert_eq!(after, sig(&idx_with(&[CACHE_NAMES, &[("C:\\R\\phoenix.txt", false)]].concat()), "pho", true));
+    }
+
+    #[test]
+    fn counts_cache_tracks_mutations() {        let mut idx = sample_index();
+        let root = Path::new("C:\\Root");
+        let opts = ListOptions { limit: 100, dirs_first: true, max_depth: Some(1) };
+        let count = |idx: &Index, name: &str| {
+            list_dir(idx, root, &opts)
+                .iter()
+                .find(|e| e.entry.name == name)
+                .map(|e| e.child_count)
+        };
+        assert_eq!(count(&idx, "sub"), Some(1));
+        // Pass through list_dir again (cache hit) — same answer.
+        assert_eq!(count(&idx, "sub"), Some(1));
+        idx.upsert(entry("C:\\Root\\sub\\extra.txt", false));
+        assert_eq!(count(&idx, "sub"), Some(2));
+        idx.remove(Path::new("C:\\Root\\sub\\extra.txt"));
+        assert_eq!(count(&idx, "sub"), Some(1));
+        idx.remove_prefix(Path::new("C:\\Root\\sub"));
+        assert_eq!(count(&idx, "sub"), None);
+    }
+
+    // ---- op -> index -> search flows (mirror the Tauri commands) ----
+
+    fn flow_root(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("eksplora-test-{}-flow-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn scan_root(root: &Path) -> Index {
+        let (entries, _) =
+            crate::scanner::scan(root, &crate::scanner::ScanOptions::default());
+        Index::from_entries(entries)
+    }
+
+    #[test]
+    fn copy_flow_then_search_finds_copy() {
+        // NOTE: tmp dir name must not contain the query word.
+        let root = flow_root("w1");
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        let mut idx = scan_root(&root);
+        assert!(sig(&idx, "copy", true).is_empty());
+        // Same sequence as the copy_entry command.
+        let dst = crate::fs_ops::copy_path(&root.join("a.txt")).unwrap();
+        idx.stat_and_upsert(&dst);
+        let hits = sig(&idx, "copy", true);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].0.ends_with("a - Copy.txt"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rename_dir_flow_moves_subtree() {
+        let root = flow_root("rename");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("deep.txt"), "d").unwrap();
+        let mut idx = scan_root(&root);
+        let old = root.join("sub");
+        // Same sequence as the rename_entry command.
+        let new_path = crate::fs_ops::rename_entry(&old, "sub2").unwrap();
+        idx.remove_prefix(&old);
+        idx.stat_and_upsert(&new_path);
+        let hits = sig(&idx, "deep", true);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].0.contains("sub2"));
+        // Old subtree path (with separator, so "sub2" can't false-match).
+        let old_child = old.join("deep.txt").to_string_lossy().into_owned();
+        assert!(!hits[0].0.contains(&old_child));
+        let kids = list_dir(
+            &idx,
+            &new_path,
+            &ListOptions { limit: 100, dirs_first: true, max_depth: Some(1) },
+        );
+        assert_eq!(kids.len(), 1);
+        assert_eq!(kids[0].entry.name, "deep.txt");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_flow_drops_entry_and_children() {
+        let root = flow_root("delete");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("deep.txt"), "d").unwrap();
+        std::fs::write(root.join("top.txt"), "t").unwrap();
+        let mut idx = scan_root(&root);
+        // Filesystem half via plain remove (the bin itself isn't testable
+        // here); index half identical to the delete_entry command.
+        std::fs::remove_dir_all(root.join("sub")).unwrap();
+        let p = root.join("sub");
+        idx.remove(&p);
+        idx.remove_prefix(&p);
+        assert!(sig(&idx, "deep", true).is_empty());
+        assert_eq!(sig(&idx, "top", true).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

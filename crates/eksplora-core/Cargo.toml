@@ -16,8 +16,11 @@ windows = { version = "0.58", features = [
   "Win32_Storage_FileSystem",
   "Win32_System_Com",
   "Win32_System_IO",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
   "Win32_System_SystemServices",
   "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
 ] }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
