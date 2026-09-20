@@ -176,15 +176,17 @@ fn watch_manager(
 ///
 /// Progressive loading: a fast depth-1 `scan_shallow` publishes the first
 /// layer within ~100ms (emitted as `scan-partial`), then the full walk runs
-/// at full speed while a trickle of `scan-partial` events (~every 600ms) keeps
-/// the list growing — including per-folder item counts. The final numbers
-/// arrive as one `scan-done` event.
+/// at full speed while a trickle of `scan-partial` events (~every 2s) keeps
+/// the list growing. Per-folder item counts tick live independently at ~4Hz
+/// via `scan-progress` (counted straight from the walk stream, not from
+/// index merges). The final numbers arrive as one `scan-done` event.
 ///
-/// Why so infrequent? Each partial triggers a full re-search + re-render,
-/// and every shared-index lock contends with search. Merging every batch
-/// (and emitting at tens of Hz) turned a ~20s scan into ~90s in testing.
-/// Buffering preview batches and merging under a single lock every 600ms
-/// keeps the overhead near zero while counts still tick live.
+/// Why are partials so infrequent? Each one triggers an index merge plus a
+/// full re-search + re-render, and every shared-index lock contends with
+/// search. Measured: 600ms merges added +38% wall time on a 90k-entry scan
+/// versus +17% at 2s. Merging every batch (tens of Hz) once turned a ~20s
+/// scan into ~90s. Buffering preview batches and merging under a single
+/// lock every 2s keeps the overhead low while the UI still feels live.
 /// Typing a new path calls this again, which cancels the previous scan.
 #[tauri::command]
 fn scan_dir(state: State<'_, AppState>, app: tauri::AppHandle, path: String) -> Result<bool, String> {
@@ -252,9 +254,9 @@ fn scan_dir(state: State<'_, AppState>, app: tauri::AppHandle, path: String) -> 
             );
 
             // Phase 2: deep walk at full speed. Preview batches are buffered
-            // lock-free and merged into the live index at most every 600ms
-            // under a single lock — frequent merging contended with search
-            // and quadrupled wall time on large trees. The final `from_entries`
+            // lock-free and merged into the live index at most every 2s under
+            // a single lock — frequent merging contended with search and
+            // quadrupled wall time on large trees. The final `from_entries`
             // replace below is authoritative, so the preview is best-effort:
             // whatever is buffered at the end is included via the replace.
             let last_emit = std::cell::Cell::new(Instant::now());
@@ -268,14 +270,14 @@ fn scan_dir(state: State<'_, AppState>, app: tauri::AppHandle, path: String) -> 
             let deep_files = std::cell::Cell::new(0u64);
             let deep_dirs = std::cell::Cell::new(0u64);
             // Lock-free staging: batch callbacks only push clones here.
-            // Drained into the shared index on the 600ms emit tick.
+            // Drained into the shared index on the 2s emit tick.
             let pending: std::cell::RefCell<Vec<eksplora_core::FileEntry>> =
                 std::cell::RefCell::new(Vec::new());
             // Live per-folder counts, counted straight from the walk stream
             // (cumulative, so always a correct-so-far lower bound converging
             // on the final index counts). Drained into scan-progress events
-            // at ~7Hz — far livelier than the index-merge tick, with no
-            // extra index locking.
+            // at ~4Hz — lively enough to watch counts tick, sparse enough
+            // to keep IPC + re-render churn (and walk-thread time) low.
             let live_counts: RefCell<eksplora_core::LiveDirCounts> =
                 RefCell::new(eksplora_core::LiveDirCounts::new());
             let emit_partial = |len: usize| {
@@ -297,7 +299,7 @@ fn scan_dir(state: State<'_, AppState>, app: tauri::AppHandle, path: String) -> 
                 Some(&|files: u64, dirs: u64| {
                     deep_files.set(files);
                     deep_dirs.set(dirs);
-                    if last_progress.get().elapsed() >= Duration::from_millis(150) {
+                    if last_progress.get().elapsed() >= Duration::from_millis(250) {
                         last_progress.set(Instant::now());
                         // Only dirs that changed since the previous tick;
                         // cumulative values, so a skipped tick loses nothing.
@@ -330,7 +332,7 @@ fn scan_dir(state: State<'_, AppState>, app: tauri::AppHandle, path: String) -> 
                     }
                     pending.borrow_mut().extend(batch.iter().cloned());
                     live_counts.borrow_mut().add_batch(batch);
-                    if last_emit.get().elapsed() >= Duration::from_millis(600) {
+                    if last_emit.get().elapsed() >= Duration::from_millis(2000) {
                         last_emit.set(Instant::now());
                         let staged = std::mem::take(&mut *pending.borrow_mut());
                         if !staged.is_empty() {

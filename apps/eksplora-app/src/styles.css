@@ -280,7 +280,7 @@ button:disabled {
   gap: 8px;
   align-items: center;
   padding: 0 10px;
-  border-bottom: 1px solid #1f232c;
+  /* border-bottom: 1px solid #1f232c; */
   font-size: 13px;
   white-space: nowrap;
   overflow: hidden;
@@ -305,46 +305,37 @@ button:disabled {
   outline-offset: -2px;
   background: rgba(43, 108, 238, 0.18);
 }
-/* Tree indent guides: full spines for ancestor levels plus one elbow cell
-   (├ tee, or └ ell for the last row of its level) whose stub runs from
-   the parent's spine to the row icon. Fixed 18px columns keep the lines
-   continuous down the list. */
-.guide {
-  align-self: stretch;
-  width: 18px;
-  flex-shrink: 0;
-  border-left: 1px solid #2c3442;
-  user-select: none;
-  -webkit-user-select: none;
+/* Expand/collapse choreography: freshly unfolded children cascade in
+   top-down (per-row delay set inline), folding rows go bottom-up. Uses the
+   independent `translate` property so it composes with the row's inline
+   `transform: translateY(...)` positioning instead of overriding it. */
+.row-expand {
+  animation: row-in 200ms ease-out backwards;
 }
-.tee,
-.ell {
-  position: relative;
-  align-self: stretch;
-  width: 18px;
-  flex-shrink: 0;
-  user-select: none;
-  -webkit-user-select: none;
+@keyframes row-in {
+  from {
+    opacity: 0;
+    translate: -12px 0;
+  }
+  to {
+    opacity: 1;
+    translate: 0 0;
+  }
 }
-.tee {
-  border-left: 1px solid #2c3442;
+.row-collapse {
+  /* `both`: retain the invisible end state after each row's fold until the
+     subtree unmounts — `backwards` would pop rows back into view. */
+  animation: row-out 130ms ease-in both;
 }
-.tee::after,
-.ell::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 50%;
-  border-top: 1px solid #2c3442;
-}
-.ell::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 0;
-  height: 50%;
-  border-left: 1px solid #2c3442;
+@keyframes row-out {
+  from {
+    opacity: 1;
+    translate: 0 0;
+  }
+  to {
+    opacity: 0;
+    translate: -12px 0;
+  }
 }
 .path-wrap {
   position: relative;

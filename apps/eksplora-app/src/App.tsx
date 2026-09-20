@@ -100,9 +100,10 @@ function highlightName(name: string, query: string): React.ReactNode {
 // Drag-and-drop payload: the moved item's full path. `text/plain` carries
 // the same value as a fallback (some webviews drop custom mime types).
 const DRAG_MIME = "text/eksplora-path";
-
-// Depth of `full` relative to `base` (direct child = 1).
-function relDepth(full: string, base: string): number {  const b = base.replace(/[\\/]+$/, "");
+// Depth of `full` relative to `base` (direct child = 1). Drives the
+// per-level row indent.
+function relDepth(full: string, base: string): number {
+  const b = base.replace(/[\\/]+$/, "");
   const rest = full.startsWith(b) ? full.slice(b.length) : full;
   const parts = rest.split(/[\\/]+/).filter(Boolean);
   return Math.max(1, parts.length);
@@ -140,11 +141,13 @@ export default function App() {
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState("");
   const [progress, setProgress] = useState<ScanProgress | null>(null);
-  // Live per-folder counts streamed with scan-progress (~7Hz). Keyed by
-  // lowercase full path; values are cumulative and converge on the final
-  // index counts. Cleared on every new scan and on scan-done, when the
-  // index itself becomes authoritative again.
-  const [liveCounts, setLiveCounts] = useState<Record<string, number>>({});
+  // Live per-folder counts streamed with scan-progress (~4Hz). A ref, not
+  // state: ticks arrive faster than renders should copy — the map (tens of
+  // thousands of keys worst case) is mutated in place and a tick counter
+  // re-renders only when a value actually changed. Cleared on every new
+  // scan and on scan-done, when the index becomes authoritative again.
+  const liveRef = useRef<Record<string, number>>({});
+  const [, setLiveTick] = useState(0);
   const [activePath, setActivePath] = useState("");
   const [copied, setCopied] = useState(false);
   const copyTimer = useRef<number | null>(null);
@@ -181,6 +184,21 @@ export default function App() {
   const [kids, setKids] = useState<Record<string, SearchHit[]>>({});
   // Mirror for use inside async callbacks (state would be stale there).
   const expandedRef = useRef<Set<string>>(new Set());
+  // Dir whose children are playing the expand animation. Set on unfold,
+  // cleared shortly after so later re-renders don't replay it.
+  const [reveal, setReveal] = useState<string | null>(null);
+  const revealTimer = useRef<number | null>(null);
+  // Dir whose subtree is playing the collapse animation. Rows stay mounted
+  // until the fold finishes, then the dir is actually removed from expanded.
+  const [collapsing, setCollapsing] = useState<string | null>(null);
+  const collapseTimer = useRef<number | null>(null);
+  // True when `row` sits strictly inside `dir` (separator-boundary aware,
+  // so `C:\AB\…` never matches dir `C:\A`).
+  function isUnderReveal(row: string, dir: string): boolean {
+    if (row === dir || !row.startsWith(dir)) return false;
+    const c = row.charAt(dir.length);
+    return c === "\\" || c === "/";
+  }
   // Focused file row (single click). Dirs expand instead of selecting.
   const [selected, setSelected] = useState<string | null>(null);
   // Drop target highlight while dragging over a dir row or quick item.
@@ -300,6 +318,29 @@ export default function App() {
   const totalSize = useMemo(() => rowVirtualizer.getTotalSize(), [rowVirtualizer, displayHits]);
   const browsing = !query.trim();
   const ghost = ghostParts();
+  // Order of freshly revealed rows within the unfolded dir, for the
+  // staggered cascade (first child slides, then the next, …).
+  const revealOrder = useMemo(() => {
+    const m = new Map<string, number>();
+    if (!browsing || collapsing != null || reveal == null) return m;
+    let n = 0;
+    for (const h of displayHits) {
+      if (h.path !== reveal && isUnderReveal(h.path, reveal)) m.set(h.path, n++);
+    }
+    return m;
+  }, [displayHits, reveal, browsing, collapsing]);
+  // Reverse order of rows folding away, for the bottom-to-top collapse:
+  // the last visible descendant goes first.
+  const collapseOrder = useMemo(() => {
+    const m = new Map<string, number>();
+    if (!browsing || collapsing == null) return m;
+    const rows: string[] = [];
+    for (const h of displayHits) {
+      if (h.path !== collapsing && isUnderReveal(h.path, collapsing)) rows.push(h.path);
+    }
+    rows.forEach((p, i) => m.set(p, rows.length - 1 - i));
+    return m;
+  }, [displayHits, collapsing, browsing]);
   // Flyout panels (rename/duplicate) open leftwards when the menu sits
   // close to the right viewport edge.
   const flyLeft = ctx != null && ctx.x > window.innerWidth - 480;
@@ -322,7 +363,17 @@ export default function App() {
     setScanning(true);
     setScanError("");
     setProgress(null);
-    setLiveCounts({});
+    liveRef.current = {};
+    setReveal(null);
+    if (revealTimer.current) {
+      window.clearTimeout(revealTimer.current);
+      revealTimer.current = null;
+    }
+    setCollapsing(null);
+    if (collapseTimer.current) {
+      window.clearTimeout(collapseTimer.current);
+      collapseTimer.current = null;
+    }
     try {
       await invoke<boolean>("scan_dir", { path: p });
     } catch (e) {
@@ -342,7 +393,7 @@ export default function App() {
       invoke("scan_cancel", {}).catch(() => {});
       setScanning(false);
       setProgress(null);
-      setLiveCounts({});
+      liveRef.current = {};
       return;
     }
     if (p === scannedRef.current || p === targetRef.current) return;
@@ -808,16 +859,53 @@ export default function App() {
     if (last && last.path === path && now - last.t < 350) return;
     lastToggleRef.current = { path, t: now };
     if (expandedRef.current.has(path)) {
-      const next = new Set(expandedRef.current);
-      next.delete(path);
-      expandedRef.current = next;
-      setExpanded(new Set(next));
+      // Collapse: bottom-to-top fold first, unmount after it finishes.
+      // Empty dirs, and anything outside browse mode (the fold maps are
+      // browse-only — otherwise this would be a dead pause), unmount now.
+      if (collapseTimer.current) window.clearTimeout(collapseTimer.current);
+      let n = 0;
+      for (const h of displayHits) {
+        if (h.path !== path && isUnderReveal(h.path, path)) n++;
+      }
+      if (n === 0 || !browsing) {
+        const next = new Set(expandedRef.current);
+        next.delete(path);
+        expandedRef.current = next;
+        setExpanded(new Set(next));
+        return;
+      }
+      setCollapsing(path);
+      const total = 130 + Math.min((n - 1) * 15, 300) + 80;
+      collapseTimer.current = window.setTimeout(() => {
+        const next = new Set(expandedRef.current);
+        next.delete(path);
+        expandedRef.current = next;
+        setExpanded(new Set(next));
+        // Only disarm our own fold — a newer collapse may be running.
+        setCollapsing((c) => (c === path ? null : c));
+        collapseTimer.current = null;
+      }, total);
       return;
     }
+    // Expanding cancels any in-flight collapse of this dir.
+    if (collapseTimer.current) {
+      window.clearTimeout(collapseTimer.current);
+      collapseTimer.current = null;
+    }
+    setCollapsing(null);
     const next = new Set(expandedRef.current);
     next.add(path);
     expandedRef.current = next;
     setExpanded(new Set(next));
+    // Play the staggered unfold on this dir's children, then disarm so
+    // later re-renders (scans, searches) don't replay it — but never steal
+    // a newer unfold's cascade.
+    setReveal(path);
+    if (revealTimer.current) window.clearTimeout(revealTimer.current);
+    revealTimer.current = window.setTimeout(() => {
+      setReveal((r) => (r === path ? null : r));
+      revealTimer.current = null;
+    }, 700);
     if (!kids[path]) fetchKids(path);
   }
 
@@ -892,14 +980,20 @@ export default function App() {
           if (e.payload.path !== targetRef.current) return; // stale scan
           setProgress(e.payload);
           // Fold live per-folder counts in (cumulative values, keyed by
-          // lowercase path). Rows overlay these while scanning.
+          // lowercase path). Mutated in place — no per-tick copy — and the
+          // view re-renders only when a value actually changed.
           const c = e.payload.counts;
           if (c && c.length > 0) {
-            setLiveCounts((prev) => {
-              const next = { ...prev };
-              for (const [p, n] of c) next[p.toLowerCase()] = n;
-              return next;
-            });
+            const m = liveRef.current;
+            let touched = false;
+            for (const [p, n] of c) {
+              const k = p.toLowerCase();
+              if (m[k] !== n) {
+                m[k] = n;
+                touched = true;
+              }
+            }
+            if (touched) setLiveTick((t) => t + 1);
           }
         });
         // Progressive loading: shallow layer arrives first (~100ms),
@@ -922,7 +1016,7 @@ export default function App() {
           // this covers the (rare) case of done arriving with no partial.
           applyVisiblePath(d.path);
           setProgress(null);
-          setLiveCounts({}); // index is authoritative again
+          liveRef.current = {}; // index is authoritative again
           setScanning(false);
           // Finish flourish on the path preview (fills, then fades out).
           setJustDone(true);
@@ -1200,20 +1294,21 @@ export default function App() {
               // While scanning, overlay the live streamed count (cumulative
               // direct children walked so far); Math.max keeps the display
               // monotonic even if a progress tick arrives out of order.
-              const live = scanning && h.is_dir ? liveCounts[h.path.toLowerCase()] : undefined;
+              const live = scanning && h.is_dir ? liveRef.current[h.path.toLowerCase()] : undefined;
               const lastCol = h.is_dir ? Math.max(h.child_count, live ?? 0) : formatSize(h.size);
               const tip = !browsing && h.matched ? `${h.score} · ${h.path}` : h.path;
-              // Tree guides: full spines for ancestor levels, then an elbow
-              // cell (├, or └ when nothing follows at this level) whose stub
-              // runs from the parent's spine to this row's icon.
-              const nextH = displayHits[v.index + 1];
-              const nextD = nextH ? relDepth(nextH.path, activePath || root) : 0;
-              const isLast = !nextH || nextD <= d;
-              const spines = Math.max(0, d - 2);
+              // Expand/collapse choreography: freshly unfolded children
+              // cascade top-down (25ms apart), folding rows go bottom-up
+              // (15ms apart). Order maps stay empty outside their moment,
+              // so scans and searches never replay anything.
+              const rIdx = revealOrder.get(h.path);
+              const cIdx = collapseOrder.get(h.path);
+              const revealed = rIdx !== undefined;
+              const folding = cIdx !== undefined;
               return (
                 <div
                   key={v.key}
-                  className={`row${selected === h.path ? " selected" : ""}${dropTarget === h.path ? " drop-target" : ""}`}
+                  className={`row${selected === h.path ? " selected" : ""}${dropTarget === h.path ? " drop-target" : ""}${revealed ? " row-expand" : ""}${folding ? " row-collapse" : ""}`}
                   style={{
                     position: "absolute",
                     top: 0,
@@ -1222,9 +1317,11 @@ export default function App() {
                     boxSizing: "border-box",
                     height: v.size,
                     transform: `translateY(${v.start}px)`,
-                    paddingLeft: 10,
+                    paddingLeft: 10 + (d - 1) * 24,
                     paddingRight: 10,
                     cursor: "pointer",
+                    ...(revealed ? { animationDelay: `${Math.min(rIdx * 25, 350)}ms` } : null),
+                    ...(folding ? { animationDelay: `${Math.min(cIdx * 15, 300)}ms` } : null),
                   }}
                   title={`${tip} — ${h.is_dir ? "click to expand/collapse · double-click to open" : "click to select · double-click to open"}`}
                   onClick={() => clickRow(h)}
@@ -1274,12 +1371,6 @@ export default function App() {
                       : undefined
                   }
                 >
-                  {Array.from({ length: spines }).map((_, i) => (
-                    <span key={i} className="guide" aria-hidden="true" />
-                  ))}
-                  {d >= 2 ? (
-                    <span className={isLast ? "ell" : "tee"} aria-hidden="true" />
-                  ) : null}
                   {h.is_dir ? <FolderIcon /> : <FileIcon />}
                   <span className="path">
                     {!browsing && h.matched ? highlightName(h.name, query) : h.name}
